@@ -1,11 +1,10 @@
-#!/usr/bin/env python
 """
 Materialize MCP Server
 
 This script creates an MCP server that dynamically generates resource templates
 based on the indexes in your Materialize cluster. For each index found in the
 catalog, a resource is registered with a URI template that accepts parameters
-for each indexed column. When a client later makes a lookup request (e.g. via
+for each indexed column. When a cligient later makes a lookup request (e.g. via
 a URL like "materialize://customers/123"), the corresponding handler queries
 the Materialize view with the provided parameters.
 """
@@ -15,7 +14,8 @@ import os
 from dataclasses import dataclass
 from typing import List
 
-import asyncpg
+import psycopg
+from psycopg.rows import dict_row
 from mcp.server.fastmcp import FastMCP
 
 # Materialize connection string (DSN) is retrieved from the environment.
@@ -29,10 +29,12 @@ mcp = FastMCP("Materialize MCP Server")
 class IndexInfo:
     on: str
     keys: List[str]
+    desc: str
+
 
 async def get_indexes() -> List[IndexInfo]:
     """
-    Connects to the Materialize cluster using asyncpg and retrieves index metadata.
+    Connects to the Materialize cluster using psycopg (psycopg 3) and retrieves index metadata.
 
     It queries a system catalog table that contains:
       - on: the view/table name the index is built on.
@@ -41,13 +43,35 @@ async def get_indexes() -> List[IndexInfo]:
     Returns:
         A list of IndexInfo objects containing the index information.
     """
-    conn = await asyncpg.connect(MZ_DSN)
-    # Query the catalog for indexes. Adjust the query if your catalog differs.
-    rows = await conn.fetch("SHOW INDEXES")
-    await conn.close()
+    async with await psycopg.AsyncConnection.connect(MZ_DSN, row_factory=dict_row) as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("""
+SELECT DISTINCT o.name AS on,
+       array_agg(
+         CASE
+           WHEN ic.on_position IS NOT NULL THEN col.name
+           ELSE ic.on_expression
+         END
+       ORDER BY ic.index_position) AS key,
+       COALESCE(com.comment, o.name) AS description
+FROM mz_indexes i
+JOIN mz_clusters c ON i.cluster_id = c.id
+JOIN mz_objects o ON i.on_id = o.id
+JOIN mz_schemas s ON o.schema_id = s.id
+JOIN mz_databases d ON s.database_id = d.id
+JOIN mz_index_columns ic ON i.id = ic.index_id
+JOIN mz_columns col ON o.id = col.id AND ic.on_position = col.position
+LEFT JOIN mz_internal.mz_comments com ON com.id = o.id AND com.object_sub_id IS NULL
+WHERE i.id LIKE 'u%'
+  AND c.name = current_setting('cluster')
+  AND s.name = current_schema()
+  AND d.name = current_database()
+GROUP BY o.name, com.comment
+""")
+            rows = await cur.fetchall()
 
     indexes = [
-        IndexInfo(on=row['on'], keys=row['key'])  # 'key' is auto-converted to List[str]
+        IndexInfo(on=row['on'], keys=row['key'],desc=row['description'])
         for row in rows
     ]
     return indexes
@@ -75,14 +99,15 @@ def generate_lookup_handler(view_name: str, index_columns: List[str]):
     func_code += "    # Build SQL conditions and corresponding values\n"
     func_code += "    conditions = []\n"
     func_code += "    values = []\n"
-    for i, col in enumerate(index_columns):
-        func_code += f"    conditions.append(f\"{col} = ${{{i+1}}}\")\n"
+    for col in index_columns:
+        func_code += f"    conditions.append(f\"{col} = %s\")\n"
         func_code += f"    values.append({col})\n"
     func_code += f"    query = f\"SELECT * FROM {view_name} WHERE \" + \" AND \".join(conditions)\n"
-    func_code += "    import asyncpg\n"
-    func_code += f"    conn = await asyncpg.connect('{MZ_DSN}')\n"
-    func_code += "    rows = await conn.fetch(query, *values)\n"
-    func_code += "    await conn.close()\n"
+    func_code += "    import psycopg\n"
+    func_code += f"    async with await psycopg.AsyncConnection.connect('{MZ_DSN}') as conn:\n"
+    func_code += "        async with conn.cursor() as cur:\n"
+    func_code += "            await cur.execute(query, values)\n"
+    func_code += "            rows = await cur.fetchall()\n"
     func_code += "    return str(rows)\n"
 
     # print('Generated function code:', func_code)
@@ -111,7 +136,7 @@ async def register_resources():
         # Generate a lookup handler with a signature that matches the URI parameters.
         handler = generate_lookup_handler(index.on, index.keys)
         # Register the resource with the MCP server.
-        mcp.resource(template)(handler)
+        mcp.resource(uri=template,name=index.on,description=index.desc)(handler)
         print(f"Registered resource template: {template}")
 
 async def main():
@@ -123,7 +148,6 @@ async def main():
     """
     await register_resources()
     await mcp.run_stdio_async()
-
 
 # Run the main coroutine if this script is executed as the main module.
 if __name__ == "__main__":
