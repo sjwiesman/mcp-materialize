@@ -18,11 +18,10 @@ import psycopg
 from psycopg.rows import dict_row
 from mcp.server.fastmcp import FastMCP
 
-# Materialize connection string (DSN) is retrieved from the environment.
-# If not set, it defaults to a local Materialize instance.
+# Materialize connection string
 MZ_DSN = os.getenv("MZ_DSN", "postgres://materialize:materialize@localhost:6875/materialize")
 
-# Create an MCP server instance with a descriptive name.
+# Create an MCP server instance with a descriptive name
 mcp = FastMCP("Materialize MCP Server")
 
 @dataclass
@@ -33,16 +32,6 @@ class IndexInfo:
 
 
 async def get_indexes() -> List[IndexInfo]:
-    """
-    Connects to the Materialize cluster using psycopg (psycopg 3) and retrieves index metadata.
-
-    It queries a system catalog table that contains:
-      - on: the view/table name the index is built on.
-      - key: a text[] of the index keys.
-
-    Returns:
-        A list of IndexInfo objects containing the index information.
-    """
     async with await psycopg.AsyncConnection.connect(MZ_DSN, row_factory=dict_row) as conn:
         async with conn.cursor() as cur:
             await cur.execute("""
@@ -69,38 +58,16 @@ WHERE i.id LIKE 'u%'
 GROUP BY o.name, com.comment
 """)
             rows = await cur.fetchall()
+    return [IndexInfo(on=row['on'], keys=row['key'], desc=row['description']) for row in rows]
 
-    indexes = [
-        IndexInfo(on=row['on'], keys=row['key'],desc=row['description'])
-        for row in rows
-    ]
-    return indexes
 
-def generate_lookup_handler(view_name: str, index_columns: List[str]):
-    """
-    Dynamically generates an asynchronous lookup handler with explicit parameters
-    matching the index columns. This ensures that the MCP server sees a function whose
-    signature exactly matches the URI template parameters.
-
-    Args:
-        view_name: The name of the view/table to query.
-        index_columns: A list of column names that form the index.
-
-    Returns:
-        A coroutine function (handler) that performs the lookup query.
-    """
-    # Build a comma-separated string of parameters (e.g., "customer_id, order_id")
+def generate_tool_handler(view_name: str, index_columns: List[str]):
     param_list = ", ".join(index_columns)
-    # Build the function code as a string.
-    # This function will:
-    #   - Build SQL conditions using the provided parameters.
-    #   - Connect to Materialize, run the query, and return the results.
     func_code = f"async def handler({param_list}):\n"
-    func_code += "    # Build SQL conditions and corresponding values\n"
     func_code += "    conditions = []\n"
     func_code += "    values = []\n"
     for col in index_columns:
-        func_code += f"    conditions.append(f\"{col} = %s\")\n"
+        func_code += f"    conditions.append(\"{col} = %s\")\n"
         func_code += f"    values.append({col})\n"
     func_code += f"    query = f\"SELECT * FROM {view_name} WHERE \" + \" AND \".join(conditions)\n"
     func_code += "    import psycopg\n"
@@ -109,46 +76,25 @@ def generate_lookup_handler(view_name: str, index_columns: List[str]):
     func_code += "            await cur.execute(query, values)\n"
     func_code += "            rows = await cur.fetchall()\n"
     func_code += "    return str(rows)\n"
-
-    # print('Generated function code:', func_code)
-
-    # Create a dictionary to hold the local variables from exec.
     local_vars = {}
     exec(func_code, globals(), local_vars)
-    # Retrieve the dynamically created function.
-    handler_func = local_vars["handler"]
-    return handler_func
+    return local_vars["handler"]
 
-async def register_resources():
-    """
-    Dynamically registers MCP resource templates based on the indexes in Materialize.
 
-    For each index:
-      - A URI template is constructed (e.g., materialize://customers/{customer_id}).
-      - A lookup handler is generated with explicit parameters matching the index keys.
-      - The resource is registered on the MCP server.
-    """
+async def register_tools():
     indexes = await get_indexes()
     for index in indexes:
-        # Construct the URI template.
-        # For multiple columns, the template will look like: materialize://table/{col1}/{col2}
-        template = f"materialize://{index.on}/" + "/".join(f"{{{col}}}" for col in index.keys)
-        # Generate a lookup handler with a signature that matches the URI parameters.
-        handler = generate_lookup_handler(index.on, index.keys)
-        # Register the resource with the MCP server.
-        mcp.resource(uri=template,name=index.on,description=index.desc)(handler)
-        print(f"Registered resource template: {template}")
+        handler = generate_tool_handler(index.on, index.keys)
+        mcp.tool(
+            name=f"Lookup {index.on}",
+            description=index.desc,
+        )(handler)
+        print(f"Registered tool: Lookup {index.on}")
+
 
 async def main():
-    """
-    Main entry point for the MCP server.
-
-    It registers all dynamic resource templates by querying Materialize for index
-    information and then starts the MCP server to begin accepting client requests.
-    """
-    await register_resources()
+    await register_tools()
     await mcp.run_stdio_async()
 
-# Run the main coroutine if this script is executed as the main module.
 if __name__ == "__main__":
     asyncio.run(main())
